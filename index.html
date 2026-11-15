@@ -94,7 +94,7 @@ const unb64 = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/'))
 function pack(sdp, type) {
   const g = re => (sdp.match(re) || [])[1];
   const fp = b64(Uint8Array.from(g(/a=fingerprint:sha-256 (\S+)/).split(':').map(h => parseInt(h, 16))));
-  const cands = [...sdp.matchAll(/a=candidate:\S+ 1 udp \d+ (\S+) (\d+) typ host/g)].map(m => m[1] + ':' + m[2]);
+  const cands = [...sdp.matchAll(/a=candidate:\S+ 1 udp \d+ (\S+) (\d+) typ host/gi)].map(m => m[1] + ':' + m[2]);
   return [type, g(/a=ice-ufrag:(\S+)/), g(/a=ice-pwd:(\S+)/), fp, cands.join(',')].join('|');
 }
 function unpack(code) {
@@ -159,6 +159,7 @@ log('secure context: ' + window.isSecureContext);
 let pc, dc, cert, offerCode, preset = false, agreed, pendingFp = null, baseEdited = false;
 function mkPc(label) {
   const p = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
+  p.oniceconnectionstatechange = () => { if (p === pc) log(label + " ICE: " + p.iceConnectionState); };
   p.onconnectionstatechange = async () => {
     if (p !== pc) return;
     log(`${label}: ${p.connectionState}`);
@@ -284,6 +285,7 @@ async function phone(frag) {
   cert = await myCert();
   const laptopFp = offer.split('|')[3];
   pc = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
+  pc.oniceconnectionstatechange = () => log('ICE: ' + pc.iceConnectionState);
   pc.onconnectionstatechange = () => { log('connection: ' + pc.connectionState); if (pc.connectionState === 'failed') pset('connection failed', 'bad'); };
   pc.ondatachannel = e => wirePhone(e.channel, laptopFp);
   await pc.setRemoteDescription(unpack(offer));
@@ -296,6 +298,7 @@ async function phone(frag) {
   await gathered(pc);
   const code = pack(pc.localDescription.sdp, 'a');
   log('phone candidates: ' + (code.split('|')[4] || 'none'));
+  log('phone SDP candidate lines: ' + ((pc.localDescription.sdp.match(/a=candidate:.*/g) || []).join(' / ') || 'none'));
   const known = (await kv.get('laptopFp')) === laptopFp;
   const showQr = () => { const n = qrSvg($('pqr'), code); $('pqrbox').hidden = false; $('showqr').hidden = true; log(`showing phone QR (${code.length} characters, ${n}×${n})`); pset('waiting for the laptop webcam'); };
   if (mungedOk && known) {
