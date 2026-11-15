@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phone pairing test</title>
+<!--
+  Real-device test: laptop and phone linked by a WebRTC data channel, no signalling server, no STUN/TURN,
+  paired by QR codes only. Photos go directly from the phone to the laptop over the local network.
+
+  Hosted (HTTPS, any static host): open the page on the laptop; the QR code points the phone to the same address.
+  Local: open http://localhost:4320/pair.html (localhost counts as secure, so the webcam works); the QR code then points
+  the phone to http://<laptop-ip>:4320/pair.html, which needs a laptop that accepts incoming connections.
+  The laptop shows a QR code; the phone's camera app scans it and opens this page on the phone.
+  First pairing: the phone shows its QR code, the laptop webcam reads it. Later: the phone scans the laptop's QR code and connects
+  without showing anything (if the phone accepts the laptop-chosen ICE credentials); otherwise the phone shows its QR code again (fallback).
+  Pairing data (own certificate, the other side's fingerprint) is kept in IndexedDB on each device. "Forget pairing" clears it.
+  QR libraries from jsDelivr (qrcode-generator, jsQR), so both devices need internet once to load the page.
+  Locally the phone page runs over plain http: the data channel and the file input work without a secure context.
+-->
+<script src="https://cdn.jsdelivr.net/npm/qrcode-generator@1.4.4/qrcode.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#667085; --line:#d9dde4; --accent:#e30613; --ok:#127a3a; --bad:#b42318; --mono: ui-monospace, Consolas, monospace; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:15px/1.5 system-ui, Segoe UI, sans-serif; background:var(--bg); color:var(--ink); }
+  main { max-width:900px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:0 0 12px; }
+  section { background:var(--card); border:1px solid var(--line); border-radius:8px; padding:16px; margin-bottom:16px; }
+  h2 { font-size:15px; margin:0 0 8px; }
+  button { font:inherit; padding:8px 16px; border:1px solid var(--line); border-radius:6px; background:#fff; cursor:pointer; margin:0 6px 6px 0; }
+  button.pri { background:var(--accent); color:#fff; border-color:var(--accent); }
+  input[type=text] { font:inherit; padding:4px 6px; width:100%; }
+  pre { font:12px/1.4 var(--mono); white-space:pre-wrap; word-break:break-all; background:#f0f2f5; padding:8px; border-radius:6px; margin:0 0 8px; max-height:50vh; overflow:auto; }
+  .row { display:flex; gap:16px; flex-wrap:wrap; align-items:flex-start; }
+  .mut { color:var(--muted); font-size:13px; } .ok { color:var(--ok); } .bad { color:var(--bad); }
+  #qr svg, #pqr svg { width:300px; height:300px; max-width:80vw; max-height:80vw; }
+  video { width:320px; max-width:100%; background:#000; border-radius:6px; }
+  #recv { max-width:100%; margin-top:8px; }
+  #cur { font-size:22px; font-weight:600; margin:0 0 12px; }
+  #state, #pstate { font-weight:600; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Phone pairing test</h1>
+
+  <section id="laptop" hidden>
+    <p>Status: <span id="state">starting…</span></p>
+    <div class="row">
+      <div><div id="qr"></div><p class="mut" id="qrinfo"></p></div>
+      <div><video id="cam" playsinline muted></video><p class="mut">Webcam: reads the phone's QR code. <span id="scan"></span></p></div>
+    </div>
+    <label class="mut">Address the phone opens (this page's own address when hosted, else this laptop's network address; change if wrong)</label>
+    <input type="text" id="base">
+    <p><label class="mut">Current instrument (sent to the phone)</label><input type="text" id="instr" value="Needle holder 14 cm — 3 of 40"></p>
+    <button id="renew">New QR code</button><button id="forget">Forget pairing</button>
+    <div id="recvinfo" class="mut"></div><img id="recv" alt="">
+  </section>
+
+  <section id="phone" hidden>
+    <p>Status: <span id="pstate">starting…</span></p>
+    <p id="cur"></p>
+    <div id="pqrbox" hidden><p>Hold this QR code in front of the laptop's webcam:</p><div id="pqr"></div></div>
+    <button id="showqr" hidden>Not connecting? Show my QR code</button>
+    <div id="cap" hidden>
+      <button class="pri" id="shoot">Take photo</button><button id="pick">Choose photo</button>
+      <input type="file" id="f1" accept="image/jpeg" capture="environment" hidden><input type="file" id="f2" accept="image/*" hidden>
+    </div>
+    <button id="pforget">Forget pairing</button>
+  </section>
+
+  <section>
+    <h2>Log</h2>
+    <pre id="log"></pre>
+    <button id="copy">Copy log</button>
+  </section>
+</main>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const t0 = performance.now();
+const log = s => { $('log').textContent += `[${((performance.now() - t0) / 1000).toFixed(1)} s] ${s}\n`; $('log').scrollTop = 1e9; };
+window.addEventListener('error', e => log('ERROR: ' + e.message));
+window.addEventListener('unhandledrejection', e => log('ERROR: ' + (e.reason?.message || e.reason)));
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText($('log').textContent); $('copy').textContent = 'Copied'; }
+  catch { const r = document.createRange(); r.selectNodeContents($('log')); const s = getSelection(); s.removeAllRanges(); s.addRange(r); $('copy').textContent = 'Selected: copy it now'; }
+};
+
+// ---------- compact signalling (as index.html) ----------
+const b64 = u8 => btoa(String.fromCharCode(...u8)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64 = s => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0));
+function pack(sdp, type) {
+  const g = re => (sdp.match(re) || [])[1];
+  const fp = b64(Uint8Array.from(g(/a=fingerprint:sha-256 (\S+)/).split(':').map(h => parseInt(h, 16))));
+  const cands = [...sdp.matchAll(/a=candidate:\S+ 1 udp \d+ (\S+) (\d+) typ host/g)].map(m => m[1] + ':' + m[2]);
+  return [type, g(/a=ice-ufrag:(\S+)/), g(/a=ice-pwd:(\S+)/), fp, cands.join(',')].join('|');
+}
+function unpack(code) {
+  const [type, ufrag, pwd, fp, cands] = code.trim().split('|');
+  const hex = [...unb64(fp)].map(b => b.toString(16).padStart(2, '0').toUpperCase()).join(':');
+  const lines = ['v=0', 'o=- 1 2 IN IP4 127.0.0.1', 's=-', 't=0 0', 'a=group:BUNDLE 0', 'a=msid-semantic: WMS',
+    'm=application 9 UDP/DTLS/SCTP webrtc-datachannel', 'c=IN IP4 0.0.0.0',
+    'a=ice-ufrag:' + ufrag, 'a=ice-pwd:' + pwd, 'a=fingerprint:sha-256 ' + hex,
+    'a=setup:' + (type === 'o' ? 'actpass' : 'active'), 'a=mid:0', 'a=sctp-port:5000', 'a=max-message-size:262144'];
+  (cands ? cands.split(',') : []).forEach((c, i) => { const k = c.lastIndexOf(':'); lines.push(`a=candidate:${i + 1} 1 udp ${2122260223 - i} ${c.slice(0, k)} ${c.slice(k + 1)} typ host generation 0`); });
+  lines.push('a=end-of-candidates');
+  return { type: type === 'o' ? 'offer' : 'answer', sdp: lines.join('\r\n') + '\r\n' };
+}
+const munge = (sdp, uf, pw) => sdp.replace(/a=ice-ufrag:\S+/g, 'a=ice-ufrag:' + uf).replace(/a=ice-pwd:\S+/g, 'a=ice-pwd:' + pw);
+const gathered = pc => new Promise(res => {
+  if (pc.iceGatheringState === 'complete') return res();
+  pc.addEventListener('icegatheringstatechange', () => pc.iceGatheringState === 'complete' && res());
+  setTimeout(res, 3000);
+});
+const rnd = n => { const A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789', v = crypto.getRandomValues(new Uint8Array(n)); return [...v].map(x => A[x % A.length]).join(''); };
+function qrSvg(el, text) { const q = qrcode(0, 'M'); q.addData(text); q.make(); el.innerHTML = q.createSvgTag(4, 16); return q.getModuleCount(); }
+
+// ---------- storage ----------
+const kv = (() => {
+  const open = new Promise((res, rej) => { const r = indexedDB.open('phone-link', 1); r.onupgradeneeded = () => r.result.createObjectStore('kv'); r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error); });
+  const tx = async (mode, f) => { const db = await open; return new Promise((res, rej) => { const t = db.transaction('kv', mode); const q = f(t.objectStore('kv')); t.oncomplete = () => res(q?.result); t.onerror = () => rej(t.error); }); };
+  return { get: k => tx('readonly', s => s.get(k)), set: (k, v) => tx('readwrite', s => s.put(v, k)), del: k => tx('readwrite', s => s.delete(k)) };
+})();
+async function myCert() {
+  let c = null;
+  try { c = await kv.get('cert'); } catch (e) { log('reading stored certificate failed: ' + e.message); }
+  if (c && c.expires > Date.now() + 864e5) { log('using stored certificate'); return c; }
+  c = await RTCPeerConnection.generateCertificate({ name: 'ECDSA', namedCurve: 'P-256' });
+  try { await kv.set('cert', c); log('new certificate generated and stored'); } catch (e) { log('STORING THE CERTIFICATE FAILED (pairing cannot be kept): ' + e.message); }
+  return c;
+}
+async function pairInfo(pc) {
+  try {
+    const st = await pc.getStats(); let pair;
+    st.forEach(s => { if (s.type === 'transport' && s.selectedCandidatePairId) pair = st.get(s.selectedCandidatePairId); });
+    if (!pair) st.forEach(s => { if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s; });
+    if (!pair) return 'selected pair unknown';
+    const l = st.get(pair.localCandidateId), r = st.get(pair.remoteCandidateId);
+    return `path: local ${l?.candidateType} ${l?.address ?? l?.ip}:${l?.port} <-> remote ${r?.candidateType} ${r?.address ?? r?.ip}:${r?.port}`;
+  } catch (e) { return 'stats failed: ' + e.message; }
+}
+const CHUNK = 64 * 1024;
+async function sendBlob(dc, blob, meta) {
+  dc.send(JSON.stringify({ kind: 'photo', ...meta, size: blob.size, type: blob.type }));
+  dc.bufferedAmountLowThreshold = 1 << 20;
+  for (let o = 0; o < blob.size; o += CHUNK) {
+    if (dc.bufferedAmount > 8 << 20) await new Promise(r => dc.addEventListener('bufferedamountlow', r, { once: true }));
+    dc.send(await blob.slice(o, o + CHUNK).arrayBuffer());
+  }
+}
+log('browser: ' + navigator.userAgent);
+log('secure context: ' + window.isSecureContext);
+
+// =====================================================================
+// Laptop
+// =====================================================================
+let pc, dc, cert, offerCode, preset = false, agreed, pendingFp = null, baseEdited = false;
+function mkPc(label) {
+  const p = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
+  p.onconnectionstatechange = async () => {
+    if (p !== pc) return;
+    log(`${label}: ${p.connectionState}`);
+    if (p.connectionState === 'connected') log(await pairInfo(p));
+    if (p.connectionState === 'failed' || p.connectionState === 'closed') { setState('link lost: new QR code', 'bad'); setTimeout(() => p === pc && newOffer(), 1000); }
+  };
+  return p;
+}
+const setState = (t, c = '') => { const el = $('state') || {}; el.textContent = t; el.className = c; };
+function wireLaptop(ch) {
+  ch.binaryType = 'arraybuffer';
+  let meta = null, parts = [], got = 0, tStart = 0;
+  ch.onopen = async () => {
+    if (ch !== dc) return;
+    setState('connected', 'ok'); log('data channel open');
+    if (pendingFp) { await kv.set('phoneFp', pendingFp); log('pairing stored (phone fingerprint)'); pendingFp = null; }
+    sendInstr();
+  };
+  ch.onclose = () => { if (ch === dc) { log('data channel closed'); } };
+  ch.onmessage = async e => {
+    if (typeof e.data === 'string') {
+      const m = JSON.parse(e.data);
+      if (m.kind === 'photo') { meta = m; parts = []; got = 0; tStart = performance.now(); log(`photo coming: ${(m.size / 1048576).toFixed(2)} MB ${m.type} "${m.name}" for "${m.instrument}" (phone: ${m.w}×${m.h})`); }
+      else if (m.kind === 'log') log('phone: ' + m.text);
+      return;
+    }
+    parts.push(e.data); got += e.data.byteLength;
+    if (meta && got >= meta.size) {
+      const ms = performance.now() - tStart, blob = new Blob(parts, { type: meta.type });
+      let dims = '?'; try { const bm = await createImageBitmap(blob); dims = bm.width + '×' + bm.height; bm.close?.(); } catch (er) { dims = 'not decodable here: ' + er.message; }
+      $('recv').src = URL.createObjectURL(blob);
+      const info = `received ${(meta.size / 1048576).toFixed(2)} MB in ${ms.toFixed(0)} ms (${(meta.size / 1048576 / ms * 1000).toFixed(1)} MB/s), ${dims}, for "${meta.instrument}"`;
+      $('recvinfo').textContent = info; log(info); meta = null;
+    }
+  };
+}
+function sendInstr() { if (dc?.readyState === 'open') dc.send(JSON.stringify({ kind: 'instr', text: $('instr').value })); }
+function drawQr() {
+  if (!offerCode) return;
+  const url = `${$('base').value}#L=${offerCode}~${agreed.uf}~${agreed.pw}`;
+  const n = qrSvg($('qr'), url);
+  $('qrinfo').textContent = `${url.length} characters, QR ${n}×${n} modules`;
+}
+async function newOffer() {
+  const old = pc; pc = null; old?.close();
+  pc = mkPc('connection'); dc = pc.createDataChannel('photos'); wireLaptop(dc);
+  offerCode = await makeOffer(pc);
+  const ips = (offerCode.split('|')[4] || '').split(',').filter(Boolean).map(c => c.slice(0, c.lastIndexOf(':')));
+  log('laptop candidates: ' + (ips.join(', ') || 'none'));
+  const ip = ips.find(a => /^\d+\.\d+\.\d+\.\d+$/.test(a));
+  const hosted = !/^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname); // served by a web host: the phone opens the same address
+  const given = new URLSearchParams(location.search).get('ip'); // local fallback: ?ip=192.168.x.y
+  if (!baseEdited) $('base').value = hosted ? location.origin + location.pathname
+    : (ip || given) ? `http://${ip || given}:${location.port}${location.pathname}` : $('base').value;
+  if (!hosted && !ip && !given && !baseEdited) log('no IPv4 candidate (mDNS names only?): enter the laptop address by hand, or open this page with ?ip=<laptop IP>');
+  drawQr();
+  const fp = await kv.get('phoneFp');
+  if (fp) {
+    await pc.setRemoteDescription(unpack(['a', agreed.uf, agreed.pw, fp, ''].join('|')));
+    preset = true; setState('waiting: phone scans the QR code (paired phone known)'); log('paired phone known: laptop completed its side from the stored pairing');
+  } else { preset = false; setState('waiting: phone scans the QR code, then shows its own (first pairing)'); log('no paired phone: first pairing'); }
+}
+async function makeOffer(p) { await p.setLocalDescription(await p.createOffer()); await gathered(p); return pack(p.localDescription.sdp, 'o'); }
+async function onPhoneQr(code) {
+  log(`phone QR read (${code.length} characters)`);
+  pendingFp = code.split('|')[3];
+  if (!preset) { await pc.setRemoteDescription(unpack(code)); log('first pairing: answer applied'); return; }
+  // fallback: the phone kept its own ICE credentials; same certificate, same credentials as the QR code it scanned
+  const [, aUf, aPw] = offerCode.split('|');
+  const old = pc; pc = mkPc('connection (fallback)'); dc = pc.createDataChannel('photos'); wireLaptop(dc);
+  const off = await pc.createOffer(); off.sdp = munge(off.sdp, aUf, aPw);
+  await pc.setLocalDescription(off); old.close();
+  if (!pc.localDescription.sdp.includes('a=ice-ufrag:' + aUf)) log('WARNING: laptop could not keep its ICE credentials');
+  await pc.setRemoteDescription(unpack(code)); preset = false; log('fallback: new connection with the phone answer');
+}
+async function startScanner() {
+  try {
+    const s = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 1280 }, height: { ideal: 720 } } });
+    $('cam').srcObject = s; await $('cam').play(); log('webcam on: ' + s.getVideoTracks()[0].label);
+  } catch (e) { log('webcam not available: ' + e.message); return; }
+  const c = document.createElement('canvas'), g = c.getContext('2d', { willReadFrequently: true }); let last = '', busy = false;
+  setInterval(async () => {
+    const v = $('cam'); if (!v.videoWidth || busy) return;
+    c.width = v.videoWidth; c.height = v.videoHeight; g.drawImage(v, 0, 0);
+    const r = jsQR(g.getImageData(0, 0, c.width, c.height).data, c.width, c.height, { inversionAttempts: 'dontInvert' });
+    $('scan').textContent = r ? 'QR code seen' : '';
+    if (r && r.data.startsWith('a|') && r.data !== last) { last = r.data; busy = true; try { await onPhoneQr(r.data); } finally { busy = false; } }
+  }, 250);
+}
+async function laptop() {
+  $('laptop').hidden = false;
+  cert = await myCert();
+  agreed = await kv.get('agreed'); if (!agreed) { agreed = { uf: rnd(8), pw: rnd(24) }; await kv.set('agreed', agreed); }
+  await startScanner(); // camera permission first: then Chrome shows real IP addresses instead of mDNS names
+  await newOffer();
+  $('base').oninput = () => { baseEdited = true; drawQr(); };
+  $('instr').onchange = sendInstr;
+  $('renew').onclick = newOffer;
+  $('forget').onclick = async () => { await kv.del('phoneFp'); log('pairing forgotten'); newOffer(); };
+}
+
+// =====================================================================
+// Phone
+// =====================================================================
+let current = '', connectedOnce = false;
+const pset = (t, c = '') => { $('pstate').textContent = t; $('pstate').className = c; };
+function wirePhone(ch, laptopFp) {
+  dc = ch; ch.binaryType = 'arraybuffer';
+  ch.onopen = async () => {
+    connectedOnce = true; pset('connected', 'ok'); log('data channel open'); $('pqrbox').hidden = true; $('showqr').hidden = true; $('cap').hidden = false;
+    const info = await pairInfo(pc); log(info);
+    await kv.set('laptopFp', laptopFp); log('pairing stored (laptop fingerprint)');
+    ch.send(JSON.stringify({ kind: 'log', text: `${navigator.userAgent} | munged credentials accepted: ${mungedOk} | ${info}` }));
+  };
+  ch.onclose = () => { pset('link lost: scan the laptop QR code again', 'bad'); $('cap').hidden = true; log('data channel closed'); };
+  ch.onmessage = e => { if (typeof e.data === 'string') { const m = JSON.parse(e.data); if (m.kind === 'instr') { current = m.text; $('cur').textContent = current; } } };
+}
+let mungedOk = false;
+async function phone(frag) {
+  $('phone').hidden = false;
+  history.replaceState(null, '', location.pathname); // the offer is single-use
+  const [offer, uf, pw] = frag.split('~');
+  cert = await myCert();
+  const laptopFp = offer.split('|')[3];
+  pc = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
+  pc.onconnectionstatechange = () => { log('connection: ' + pc.connectionState); if (pc.connectionState === 'failed') pset('connection failed', 'bad'); };
+  pc.ondatachannel = e => wirePhone(e.channel, laptopFp);
+  await pc.setRemoteDescription(unpack(offer));
+  const ans = await pc.createAnswer();
+  try {
+    await pc.setLocalDescription({ type: 'answer', sdp: munge(ans.sdp, uf, pw) });
+    mungedOk = pc.localDescription.sdp.includes('a=ice-ufrag:' + uf);
+    log('laptop-chosen ICE credentials ' + (mungedOk ? 'ACCEPTED' : 'IGNORED (browser kept its own)'));
+  } catch (e) { log('laptop-chosen ICE credentials REFUSED: ' + e.name + ': ' + e.message); await pc.setLocalDescription(ans); }
+  await gathered(pc);
+  const code = pack(pc.localDescription.sdp, 'a');
+  log('phone candidates: ' + (code.split('|')[4] || 'none'));
+  const known = (await kv.get('laptopFp')) === laptopFp;
+  const showQr = () => { const n = qrSvg($('pqr'), code); $('pqrbox').hidden = false; $('showqr').hidden = true; log(`showing phone QR (${code.length} characters, ${n}×${n})`); pset('waiting for the laptop webcam'); };
+  if (mungedOk && known) {
+    pset('paired before: connecting…'); log('paired before and credentials accepted: connecting without a QR code');
+    setTimeout(() => { if (!connectedOnce) { $('showqr').hidden = false; log('not connected after 6 s'); } }, 6000);
+    $('showqr').onclick = showQr;
+  } else { log(known ? 'paired before, but the fallback is needed' : 'first pairing'); showQr(); }
+  $('shoot').onclick = () => $('f1').click(); $('pick').onclick = () => $('f2').click();
+  for (const id of ['f1', 'f2']) $(id).onchange = async () => {
+    const f = $(id).files[0]; $(id).value = ''; if (!f || dc?.readyState !== 'open') return;
+    let w = '?', h = '?'; try { const bm = await createImageBitmap(f); w = bm.width; h = bm.height; bm.close?.(); } catch { }
+    log(`photo: ${(f.size / 1048576).toFixed(2)} MB ${f.type} "${f.name}" ${w}×${h}`);
+    const ts = performance.now(); await sendBlob(dc, f, { instrument: current, name: f.name, w, h });
+    log(`queued in ${(performance.now() - ts).toFixed(0)} ms`);
+  };
+}
+
+// ---------- start ----------
+$('pforget').onclick = async () => { await kv.del('laptopFp'); log('pairing forgotten'); };
+window.addEventListener('hashchange', () => location.reload()); // a new QR code scanned while this page is open
+const m = location.hash.match(/^#L=(.+)$/);
+if (m) phone(decodeURIComponent(m[1])); else laptop();
+</script>
+</body>
+</html>
