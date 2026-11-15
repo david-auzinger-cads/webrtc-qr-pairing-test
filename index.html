@@ -155,6 +155,18 @@ async function myCert() {
   try { await kv.set('cert', c); log('new certificate generated and stored'); } catch (e) { log('STORING THE CERTIFICATE FAILED (pairing cannot be kept): ' + e.message); }
   return c;
 }
+/** what the connectivity checks did: per candidate pair, requests/responses sent and received (shows in which direction packets were lost) */
+async function iceReport(p, why) {
+  try {
+    const st = await p.getStats(), lines = [];
+    st.forEach(x => {
+      if (x.type !== 'candidate-pair') return;
+      const l = st.get(x.localCandidateId), r = st.get(x.remoteCandidateId);
+      lines.push(`  ${l?.protocol} ${l?.address ?? l?.ip}:${l?.port} (${l?.candidateType}) -> ${r?.address ?? r?.ip}:${r?.port} (${r?.candidateType}): ${x.state}, requests sent ${x.requestsSent ?? '?'} / received ${x.requestsReceived ?? '?'}, responses received ${x.responsesReceived ?? '?'} / sent ${x.responsesSent ?? '?'}`);
+    });
+    log(`ICE check report (${why}):\n` + (lines.join('\n') || '  no candidate pairs'));
+  } catch (e) { log('ICE report failed: ' + e.message); }
+}
 async function pairInfo(pc) {
   try {
     const st = await pc.getStats(); let pair;
@@ -199,11 +211,12 @@ function liveCfg() { return { kind: 'live', on: true, width: +$('lw').value, fps
 function remoteShoot() { shotT = performance.now(); log('shutter sent'); sendCtl({ kind: 'shoot' }); }
 function mkPc(label) {
   const p = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
-  p.oniceconnectionstatechange = () => { if (p === pc) log(label + " ICE: " + p.iceConnectionState); };
+  p.oniceconnectionstatechange = () => { if (p !== pc) return; log(label + " ICE: " + p.iceConnectionState); if (p.iceConnectionState === 'checking') setTimeout(() => { if (p === pc && p.iceConnectionState === 'checking') iceReport(p, 'still checking after 5 s'); }, 5000); };
   p.onconnectionstatechange = async () => {
     if (p !== pc) return;
     log(`${label}: ${p.connectionState}`);
     if (p.connectionState === 'connected') log(await pairInfo(p));
+    if (p.connectionState === 'failed') await iceReport(p, 'failed');
     if (p.connectionState === 'failed' || p.connectionState === 'closed') { setState('link lost: new QR code', 'bad'); setTimeout(() => p === pc && newOffer(), 1000); }
   };
   return p;
@@ -412,8 +425,8 @@ async function connect(data) {
   const laptopFp = offer.split('|')[3];
   mungedOk = false;
   pc = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
-  pc.oniceconnectionstatechange = () => log('ICE: ' + pc?.iceConnectionState);
-  pc.onconnectionstatechange = () => { if (!pc) return; log('connection: ' + pc.connectionState); if (pc.connectionState === 'failed') { pset('connection failed', 'bad'); stopCam(); $('rescan').hidden = false; } };
+  pc.oniceconnectionstatechange = () => { const p = pc; if (!p) return; log('ICE: ' + p.iceConnectionState); if (p.iceConnectionState === 'checking') setTimeout(() => { if (p === pc && p.iceConnectionState === 'checking') iceReport(p, 'still checking after 5 s'); }, 5000); };
+  pc.onconnectionstatechange = async () => { if (!pc) return; log('connection: ' + pc.connectionState); if (pc.connectionState === 'failed') { await iceReport(pc, 'failed'); pset('connection failed', 'bad'); stopCam(); $('rescan').hidden = false; } };
   pc.ondatachannel = e => wirePhone(e.channel, laptopFp);
   pprev = pc.createDataChannel('preview', { negotiated: true, id: 7, ordered: false, maxRetransmits: 0 });
   await pc.setRemoteDescription(unpack(offer));
