@@ -269,7 +269,7 @@ const pset = (t, c = '') => { $('pstate').textContent = t; $('pstate').className
 function wirePhone(ch, laptopFp) {
   dc = ch; ch.binaryType = 'arraybuffer';
   ch.onopen = async () => {
-    connectedOnce = true; pset('connected', 'ok'); log('data channel open'); $('pqrbox').hidden = true; $('showqr').hidden = true; $('cap').hidden = false;
+    connectedOnce = true; camStream?.getTracks().forEach(t => t.stop()); pset('connected', 'ok'); log('data channel open'); $('pqrbox').hidden = true; $('showqr').hidden = true; $('cap').hidden = false;
     const info = await pairInfo(pc); log(info);
     await kv.set('laptopFp', laptopFp); log('pairing stored (laptop fingerprint)');
     ch.send(JSON.stringify({ kind: 'log', text: `${navigator.userAgent} | munged credentials accepted: ${mungedOk} | ${info}` }));
@@ -277,12 +277,16 @@ function wirePhone(ch, laptopFp) {
   ch.onclose = () => { pset('link lost: scan the laptop QR code again', 'bad'); $('cap').hidden = true; log('data channel closed'); };
   ch.onmessage = e => { if (typeof e.data === 'string') { const m = JSON.parse(e.data); if (m.kind === 'instr') { current = m.text; $('cur').textContent = current; } } };
 }
-let mungedOk = false;
+let mungedOk = false, camStream = null;
 async function phone(frag) {
   $('phone').hidden = false;
   history.replaceState(null, '', location.pathname); // the offer is single-use
   const [offer, uf, pw] = frag.split('~');
   cert = await myCert();
+  // camera permission first: without it the browser hides this phone's IP behind a random .local name, which the laptop must
+  // resolve by multicast; with a firewall that blocks inbound, the laptop must know the real address to send first
+  try { camStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } }); log('camera permission granted: real IP addresses can be used'); }
+  catch (e) { log('camera permission not granted (' + e.name + '): only .local names'); }
   const laptopFp = offer.split('|')[3];
   pc = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
   pc.oniceconnectionstatechange = () => log('ICE: ' + pc.iceConnectionState);
