@@ -420,33 +420,51 @@ async function scanLaptop() {
   }, 250);
 }
 function stopCam() { camStream?.getTracks().forEach(t => t.stop()); camStream = null; }
-async function connect(data) {
+/** ICE username fragment the browser's ICE agent really uses (from getStats), which can differ from the SDP text after munging */
+async function realUfrag(p) {
+  try { let u = null; (await p.getStats()).forEach(x => { if (x.type === 'local-candidate' && x.usernameFragment) u = x.usernameFragment; }); return u; } catch { return null; }
+}
+/**
+ * Connect to the laptop. tryAgreed: set the laptop-chosen ICE credentials (only useful for a phone paired before; one-scan reconnect).
+ * Chrome on Android shows munged credentials in localDescription but its ICE agent keeps its own: checked via getStats, and
+ * then the phone falls back at once to its own credentials and shows its QR code.
+ */
+async function connect(data, tryAgreed = true) {
   const [offer, uf, pw] = data.split('~');
   const laptopFp = offer.split('|')[3];
-  mungedOk = false;
-  pc = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
-  pc.oniceconnectionstatechange = () => { const p = pc; if (!p) return; log('ICE: ' + p.iceConnectionState); if (p.iceConnectionState === 'checking') setTimeout(() => { if (p === pc && p.iceConnectionState === 'checking') iceReport(p, 'still checking after 5 s'); }, 5000); };
-  pc.onconnectionstatechange = async () => { if (!pc) return; log('connection: ' + pc.connectionState); if (pc.connectionState === 'failed') { await iceReport(pc, 'failed'); pset('connection failed', 'bad'); stopCam(); $('rescan').hidden = false; } };
-  pc.ondatachannel = e => wirePhone(e.channel, laptopFp);
-  pprev = pc.createDataChannel('preview', { negotiated: true, id: 7, ordered: false, maxRetransmits: 0 });
-  await pc.setRemoteDescription(unpack(offer));
-  const ans = await pc.createAnswer();
-  try {
-    await pc.setLocalDescription({ type: 'answer', sdp: munge(ans.sdp, uf, pw) });
-    mungedOk = pc.localDescription.sdp.includes('a=ice-ufrag:' + uf);
-    log('laptop-chosen ICE credentials ' + (mungedOk ? 'ACCEPTED' : 'IGNORED (browser kept its own)'));
-  } catch (e) { log('laptop-chosen ICE credentials REFUSED: ' + e.name + ': ' + e.message); await pc.setLocalDescription(ans); }
-  await gathered(pc);
-  const code = pack(pc.localDescription.sdp, 'a');
-  log('phone candidates: ' + (code.split('|')[4] || 'none'));
-  log('phone SDP candidate lines: ' + ((pc.localDescription.sdp.match(/a=candidate:.*/g) || []).join(' / ') || 'none'));
   const known = (await kv.get('laptopFp')) === laptopFp;
+  const wantAgreed = tryAgreed && known;
+  mungedOk = false;
+  pc?.close();
+  const p = pc = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
+  p.oniceconnectionstatechange = () => { if (p !== pc) return; log('ICE: ' + p.iceConnectionState); if (p.iceConnectionState === 'checking') setTimeout(() => { if (p === pc && p.iceConnectionState === 'checking') iceReport(p, 'still checking after 5 s'); }, 5000); };
+  p.onconnectionstatechange = async () => { if (p !== pc) return; log('connection: ' + p.connectionState); if (p.connectionState === 'failed') { await iceReport(p, 'failed'); pset('connection failed', 'bad'); stopCam(); $('rescan').hidden = false; } };
+  p.ondatachannel = e => wirePhone(e.channel, laptopFp);
+  pprev = p.createDataChannel('preview', { negotiated: true, id: 7, ordered: false, maxRetransmits: 0 });
+  await p.setRemoteDescription(unpack(offer));
+  const ans = await p.createAnswer();
+  if (wantAgreed) {
+    try { await p.setLocalDescription({ type: 'answer', sdp: munge(ans.sdp, uf, pw) }); }
+    catch (e) { log('laptop-chosen ICE credentials REFUSED: ' + e.name + ': ' + e.message); return connect(data, false); }
+  } else await p.setLocalDescription(ans);
+  await gathered(p);
+  if (p !== pc) return;
+  const sdpUf = (p.localDescription.sdp.match(/a=ice-ufrag:(\S+)/) || [])[1], agentUf = await realUfrag(p);
+  log(`ICE ufrag in SDP: ${sdpUf}, used by the ICE agent: ${agentUf ?? 'unknown'}`);
+  if (wantAgreed) {
+    mungedOk = sdpUf === uf && (agentUf === null || agentUf === uf);
+    log('laptop-chosen ICE credentials ' + (mungedOk ? 'ACCEPTED' : 'IGNORED by the browser: fallback with its own credentials'));
+    if (!mungedOk) return connect(data, false);
+  }
+  const code = pack(p.localDescription.sdp, 'a');
+  log('phone candidates: ' + (code.split('|')[4] || 'none'));
+  log('phone SDP candidate lines: ' + ((p.localDescription.sdp.match(/a=candidate:.*/g) || []).join(' / ') || 'none'));
   const showQr = () => { const n = qrSvg($('pqr'), code); $('pqrbox').hidden = false; $('showqr').hidden = true; log(`showing phone QR (${code.length} characters, ${n}×${n})`); pset('waiting for the laptop webcam'); };
-  if (mungedOk && known) {
+  if (mungedOk) {
     pset('paired before: connecting…'); log('paired before and credentials accepted: connecting without a QR code');
-    setTimeout(() => { if (!connectedOnce && pc) { $('showqr').hidden = false; log('not connected after 6 s'); } }, 6000);
-    $('showqr').onclick = showQr;
-  } else { log(known ? 'paired before, but the fallback is needed' : 'first pairing'); showQr(); }
+    setTimeout(() => { if (!connectedOnce && p === pc) { $('showqr').hidden = false; log('not connected after 6 s'); } }, 6000);
+    $('showqr').onclick = () => { log('fallback requested: new connection with own credentials'); connect(data, false); };
+  } else { log(known ? 'paired before: fallback with own credentials' : 'first pairing (own credentials)'); showQr(); }
 }
 
 // ---------- start ----------
