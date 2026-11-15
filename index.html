@@ -12,6 +12,10 @@
   The laptop shows a QR code with its connection data; the phone page reads it with the phone's camera.
   First pairing: the phone then shows its QR code, and the laptop webcam reads it. Later: the phone reads the laptop's QR code and
   connects without showing anything (if the phone accepts the laptop-chosen ICE credentials); otherwise the phone shows its QR code again (fallback).
+  Live view: the laptop asks the phone for small JPEG frames (width and frame rate chosen on the laptop) over a second, lossy data
+  channel ("preview", negotiated id 7, unordered, no retransmits: no renegotiation needed). Remote shutter: the laptop sends
+  "shoot"; the phone takes a full-resolution still from the same camera track (ImageCapture.takePhoto where available, else a
+  full-size video frame) and sends it like any photo.
   The phone page holds camera permission while it connects, so the browser offers its real IP address instead of a .local name.
   Pairing data (own certificate, the other side's fingerprint) is kept in IndexedDB on each device. "Forget pairing" clears it.
   QR libraries from jsDelivr (qrcode-generator, jsQR), so both devices need internet once to load the page.
@@ -36,6 +40,9 @@
   #qr svg, #pqr svg { width:300px; height:300px; max-width:80vw; max-height:80vw; }
   video { width:320px; max-width:100%; background:#000; border-radius:6px; }
   #recv { max-width:100%; margin-top:8px; }
+  #live { max-width:100%; background:#000; display:block; }
+  #lcam { width:160px; }
+  select { font:inherit; }
   #cur { font-size:22px; font-weight:600; margin:0 0 12px; }
   #state, #pstate { font-weight:600; }
 </style>
@@ -57,6 +64,17 @@
     </div>
     <p><label class="mut">Current instrument (sent to the phone)</label><input type="text" id="instr" value="Needle holder 14 cm — 3 of 40"></p>
     <button id="renew">New QR code</button><button id="forget">Forget pairing</button><button class="switch">Switch role</button>
+    <div id="livebox" hidden>
+      <h2>Live view</h2>
+      <div class="row">
+        <button class="pri" id="liveOn">Start live view</button><button id="liveOff">Stop</button>
+        <label class="mut">Width <select id="lw"><option>320</option><option selected>640</option><option>960</option><option>1280</option></select></label>
+        <label class="mut">Frames/s <select id="lf"><option>1</option><option selected>2</option><option>5</option><option>10</option></select></label>
+        <button class="pri" id="remote">Take photo <kbd>Space</kbd></button>
+      </div>
+      <p class="mut" id="livestats"></p>
+      <img id="live" alt="">
+    </div>
     <div id="recvinfo" class="mut"></div><img id="recv" alt="">
   </section>
 
@@ -68,7 +86,9 @@
     <div id="pqrbox" hidden><p>Hold this QR code in front of the laptop's webcam:</p><div id="pqr"></div></div>
     <button id="showqr" hidden>Not connecting? Show my QR code</button>
     <div id="cap" hidden>
-      <button class="pri" id="shoot">Take photo</button><button id="pick">Choose photo</button>
+      <div id="livep" hidden><p class="mut" id="pliveinfo">Live camera on.</p><video id="lcam" playsinline muted></video><br>
+        <button class="pri" id="lshoot">Take photo (live camera)</button></div>
+      <button class="pri" id="shoot">Take photo (camera app)</button><button id="pick">Choose photo</button>
       <input type="file" id="f1" accept="image/jpeg" capture="environment" hidden><input type="file" id="f2" accept="image/*" hidden>
     </div>
     <button id="pforget">Forget pairing</button><button class="switch">Switch role</button>
@@ -160,7 +180,23 @@ log('secure context: ' + window.isSecureContext);
 // =====================================================================
 // Laptop
 // =====================================================================
-let pc, dc, cert, offerCode, preset = false, agreed, pendingFp = null;
+let pc, dc, cert, offerCode, preset = false, agreed, pendingFp = null, prev = null;
+const PREVIEW = { negotiated: true, id: 7, ordered: false, maxRetransmits: 0 };
+let lastUrl = null, frames = 0, frameBytes = 0, statT = performance.now(), shotT = 0;
+function wirePreview(ch) {
+  prev = ch; ch.binaryType = 'arraybuffer';
+  ch.onmessage = e => {
+    if (ch !== prev || typeof e.data === 'string') return;
+    const u = URL.createObjectURL(new Blob([e.data], { type: 'image/jpeg' }));
+    $('live').src = u; if (lastUrl) URL.revokeObjectURL(lastUrl); lastUrl = u;
+    frames++; frameBytes += e.data.byteLength;
+    const dt = (performance.now() - statT) / 1000;
+    if (dt >= 2) { $('livestats').textContent = `${(frames / dt).toFixed(1)} frames/s received, ${(frameBytes / frames / 1024).toFixed(0)} kB per frame, ${(frameBytes / dt / 1024).toFixed(0)} kB/s`; frames = 0; frameBytes = 0; statT = performance.now(); }
+  };
+}
+function sendCtl(m) { if (dc?.readyState === 'open') dc.send(JSON.stringify(m)); else log('not connected'); }
+function liveCfg() { return { kind: 'live', on: true, width: +$('lw').value, fps: +$('lf').value }; }
+function remoteShoot() { shotT = performance.now(); log('shutter sent'); sendCtl({ kind: 'shoot' }); }
 function mkPc(label) {
   const p = new RTCPeerConnection({ iceServers: [], certificates: [cert] });
   p.oniceconnectionstatechange = () => { if (p === pc) log(label + " ICE: " + p.iceConnectionState); };
@@ -178,7 +214,7 @@ function wireLaptop(ch) {
   let meta = null, parts = [], got = 0, tStart = 0;
   ch.onopen = async () => {
     if (ch !== dc) return;
-    setState('connected', 'ok'); log('data channel open');
+    setState('connected', 'ok'); log('data channel open'); $('livebox').hidden = false;
     if (pendingFp) { await kv.set('phoneFp', pendingFp); log('pairing stored (phone fingerprint)'); pendingFp = null; }
     sendInstr();
   };
@@ -186,7 +222,7 @@ function wireLaptop(ch) {
   ch.onmessage = async e => {
     if (typeof e.data === 'string') {
       const m = JSON.parse(e.data);
-      if (m.kind === 'photo') { meta = m; parts = []; got = 0; tStart = performance.now(); log(`photo coming: ${(m.size / 1048576).toFixed(2)} MB ${m.type} "${m.name}" for "${m.instrument}" (phone: ${m.w}×${m.h})`); }
+      if (m.kind === 'photo') { meta = m; parts = []; got = 0; tStart = performance.now(); log(`photo coming: ${(m.size / 1048576).toFixed(2)} MB ${m.type} "${m.name}" for "${m.instrument}" (phone: ${m.w}×${m.h}${m.how ? ', ' + m.how + ', ' + m.ms + ' ms on the phone' : ''})` + (shotT ? `, ${(performance.now() - shotT).toFixed(0)} ms after the shutter` : '')); shotT = 0; }
       else if (m.kind === 'log') log('phone: ' + m.text);
       return;
     }
@@ -209,7 +245,7 @@ function drawQr() {
 }
 async function newOffer() {
   const old = pc; pc = null; old?.close();
-  pc = mkPc('connection'); dc = pc.createDataChannel('photos'); wireLaptop(dc);
+  pc = mkPc('connection'); dc = pc.createDataChannel('photos'); wireLaptop(dc); wirePreview(pc.createDataChannel('preview', PREVIEW));
   offerCode = await makeOffer(pc);
   const ips = (offerCode.split('|')[4] || '').split(',').filter(Boolean).map(c => c.slice(0, c.lastIndexOf(':')));
   log('laptop candidates: ' + (ips.join(', ') || 'none'));
@@ -227,7 +263,7 @@ async function onPhoneQr(code) {
   if (!preset) { await pc.setRemoteDescription(unpack(code)); log('first pairing: answer applied'); return; }
   // fallback: the phone kept its own ICE credentials; same certificate, same credentials as the QR code it scanned
   const [, aUf, aPw] = offerCode.split('|');
-  const old = pc; pc = mkPc('connection (fallback)'); dc = pc.createDataChannel('photos'); wireLaptop(dc);
+  const old = pc; pc = mkPc('connection (fallback)'); dc = pc.createDataChannel('photos'); wireLaptop(dc); wirePreview(pc.createDataChannel('preview', PREVIEW));
   const off = await pc.createOffer(); off.sdp = munge(off.sdp, aUf, aPw);
   await pc.setLocalDescription(off); old.close();
   if (!pc.localDescription.sdp.includes('a=ice-ufrag:' + aUf)) log('WARNING: laptop could not keep its ICE credentials');
@@ -254,6 +290,10 @@ async function laptop() {
   await startScanner(); // camera permission first: then Chrome shows real IP addresses instead of mDNS names
   await newOffer();
   $('instr').onchange = sendInstr;
+  $('liveOn').onclick = () => sendCtl(liveCfg()); $('liveOff').onclick = () => sendCtl({ kind: 'live', on: false });
+  $('lw').onchange = $('lf').onchange = () => sendCtl(liveCfg());
+  $('remote').onclick = remoteShoot;
+  document.addEventListener('keydown', e => { if (e.key === ' ' && e.target.tagName !== 'INPUT' && dc?.readyState === 'open') { e.preventDefault(); remoteShoot(); } });
   $('renew').onclick = newOffer;
   $('forget').onclick = async () => { await kv.del('phoneFp'); log('pairing forgotten'); newOffer(); };
 }
@@ -271,10 +311,67 @@ function wirePhone(ch, laptopFp) {
     await kv.set('laptopFp', laptopFp); log('pairing stored (laptop fingerprint)');
     ch.send(JSON.stringify({ kind: 'log', text: `${navigator.userAgent} | munged credentials accepted: ${mungedOk} | ${info}` }));
   };
-  ch.onclose = () => { if (ch !== dc) return; pset('link lost: scan the laptop QR code again', 'bad'); $('cap').hidden = true; $('rescan').hidden = false; log('data channel closed'); };
-  ch.onmessage = e => { if (typeof e.data === 'string') { const m = JSON.parse(e.data); if (m.kind === 'instr') { current = m.text; $('cur').textContent = current; } } };
+  ch.onclose = () => { if (ch !== dc) return; if (live) stopLive(); pset('link lost: scan the laptop QR code again', 'bad'); $('cap').hidden = true; $('rescan').hidden = false; log('data channel closed'); };
+  ch.onmessage = async e => {
+    if (typeof e.data !== 'string') return;
+    const m = JSON.parse(e.data);
+    if (m.kind === 'instr') { current = m.text; $('cur').textContent = current; }
+    else if (m.kind === 'live') {
+      if (m.on) { liveCfgP = { width: m.width || 640, fps: m.fps || 2 }; log(`live view requested: ${liveCfgP.width} px, ${liveCfgP.fps} frames/s`); try { await startLive(); } catch (er) { log('live camera failed: ' + er.name + ': ' + er.message); } }
+      else stopLive();
+    } else if (m.kind === 'shoot') { log('remote shutter'); await liveShoot('remote'); }
+  };
 }
 let mungedOk = false, camStream = null, scanTimer = null;
+let live = null, ic = null, liveTimer = null, pprev = null, wake = null, liveCfgP = { width: 640, fps: 2 }, sent = 0;
+async function startLive() {
+  if (!live) {
+    live = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment', width: { ideal: 4096 }, height: { ideal: 3072 } } });
+    const t = live.getVideoTracks()[0];
+    try { const c = t.getCapabilities?.(); if (c?.width?.max && c?.height?.max) await t.applyConstraints({ width: { ideal: c.width.max }, height: { ideal: c.height.max } }); } catch (e) { log('applyConstraints: ' + e.message); }
+    $('lcam').srcObject = live; await $('lcam').play(); $('livep').hidden = false;
+    const st = t.getSettings();
+    log(`live camera: ${st.width}×${st.height} @ ${st.frameRate} fps (${t.label})`);
+    if (window.ImageCapture) {
+      ic = new ImageCapture(t);
+      try { const p = await ic.getPhotoCapabilities(); log(`photo capabilities: up to ${p.imageWidth?.max}×${p.imageHeight?.max}, fill light: ${p.fillLightMode}`); } catch (e) { log('getPhotoCapabilities failed: ' + e.message); }
+    } else log('ImageCapture not available: remote photos are full-size video frames');
+    try { wake = await navigator.wakeLock?.request('screen'); } catch { }
+  }
+  clearInterval(liveTimer);
+  const c = document.createElement('canvas'), g = c.getContext('2d');
+  liveTimer = setInterval(async () => {
+    const v = $('lcam'); if (!v.videoWidth || pprev?.readyState !== 'open' || pprev.bufferedAmount > 150000) return;
+    c.width = liveCfgP.width; c.height = Math.round(liveCfgP.width * v.videoHeight / v.videoWidth); g.drawImage(v, 0, 0, c.width, c.height);
+    const b = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.6)); if (!b || pprev?.readyState !== 'open') return;
+    try { pprev.send(await b.arrayBuffer()); sent++; } catch (e) { log('frame send failed: ' + e.message); }
+  }, 1000 / liveCfgP.fps);
+  $('pliveinfo').textContent = `Live camera on: sending ${liveCfgP.width} px at ${liveCfgP.fps} frames/s.`;
+}
+function stopLive() {
+  clearInterval(liveTimer); liveTimer = null; live?.getTracks().forEach(t => t.stop()); live = null; ic = null; $('livep').hidden = true;
+  try { wake?.release(); } catch { } wake = null; log(`live view stopped (${sent} frames sent)`); sent = 0;
+}
+async function liveShoot(source) {
+  try {
+    if (!live) await startLive();
+    const ts = performance.now(); let blob = null, how = '';
+    if (ic) {
+      try {
+        const p = await ic.getPhotoCapabilities();
+        blob = await ic.takePhoto(p?.imageWidth?.max ? { imageWidth: p.imageWidth.max, imageHeight: p.imageHeight.max } : undefined); how = 'takePhoto';
+      } catch (e) { log('takePhoto failed: ' + e.name + ': ' + e.message); }
+    }
+    if (!blob) {
+      const v = $('lcam'), c = document.createElement('canvas'); c.width = v.videoWidth; c.height = v.videoHeight;
+      c.getContext('2d').drawImage(v, 0, 0); blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92)); how = 'video frame';
+    }
+    const ms = Math.round(performance.now() - ts);
+    let w = '?', h = '?'; try { const bm = await createImageBitmap(blob); w = bm.width; h = bm.height; bm.close?.(); } catch { }
+    log(`${source} photo: ${how}, ${w}×${h}, ${(blob.size / 1048576).toFixed(2)} MB, ${ms} ms`);
+    await sendBlob(dc, blob, { instrument: current, name: how.replace(' ', '-') + '.jpg', w, h, how, ms });
+  } catch (e) { log('photo failed: ' + e.name + ': ' + e.message); }
+}
 async function phone() {
   $('phone').hidden = false;
   cert = await myCert();
@@ -287,6 +384,7 @@ async function phone() {
     log(`queued in ${(performance.now() - ts).toFixed(0)} ms`);
   };
   $('rescan').onclick = scanLaptop;
+  $('lshoot').onclick = () => liveShoot('phone');
   scanLaptop();
 }
 /** camera on, read the laptop QR code; the camera stays on until connected (real IP addresses, see header) */
@@ -317,6 +415,7 @@ async function connect(data) {
   pc.oniceconnectionstatechange = () => log('ICE: ' + pc?.iceConnectionState);
   pc.onconnectionstatechange = () => { if (!pc) return; log('connection: ' + pc.connectionState); if (pc.connectionState === 'failed') { pset('connection failed', 'bad'); stopCam(); $('rescan').hidden = false; } };
   pc.ondatachannel = e => wirePhone(e.channel, laptopFp);
+  pprev = pc.createDataChannel('preview', { negotiated: true, id: 7, ordered: false, maxRetransmits: 0 });
   await pc.setRemoteDescription(unpack(offer));
   const ans = await pc.createAnswer();
   try {
