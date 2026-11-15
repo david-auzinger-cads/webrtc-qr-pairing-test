@@ -91,7 +91,7 @@
       <button class="pri" id="shoot">Take photo (camera app)</button><button id="pick">Choose photo</button>
       <input type="file" id="f1" accept="image/jpeg" capture="environment" hidden><input type="file" id="f2" accept="image/*" hidden>
     </div>
-    <button id="pforget">Forget pairing</button><button class="switch">Switch role</button>
+    <button id="pforget">Forget pairing</button><button class="switch">Switch role</button><button id="selftest">Self-test (this device only)</button>
   </section>
 
   <section>
@@ -466,6 +466,25 @@ async function connect(data, tryAgreed = true) {
     $('showqr').onclick = () => { log('fallback requested: new connection with own credentials'); connect(data, false); };
   } else { log(known ? 'paired before: fallback with own credentials' : 'first pairing (own credentials)'); showQr(); }
 }
+
+// ---------- self-test: two connections inside this page, over this device's own addresses ----------
+async function selfTest() {
+  log('self-test: starting (camera permission ' + (camStream || live ? 'held' : 'not held') + ')');
+  const a = new RTCPeerConnection({ iceServers: [] }), b = new RTCPeerConnection({ iceServers: [] });
+  const ca = a.createDataChannel('t');
+  a.onicecandidate = e => e.candidate && b.addIceCandidate(e.candidate).catch(() => { });
+  b.onicecandidate = e => e.candidate && a.addIceCandidate(e.candidate).catch(() => { });
+  const got = new Promise(r => b.ondatachannel = e => e.channel.onmessage = m => r(m.data));
+  await a.setLocalDescription(await a.createOffer()); await b.setRemoteDescription(a.localDescription);
+  await b.setLocalDescription(await b.createAnswer()); await a.setRemoteDescription(b.localDescription);
+  const r = await new Promise(res => { ca.onopen = () => res('open'); setTimeout(() => res('not open (' + a.connectionState + ')'), 8000); });
+  if (r === 'open') { ca.send('ping'); log('self-test: data channel ' + r + ', message ' + (await got)); log('self-test ' + await pairInfo(a)); }
+  else { log('self-test: data channel ' + r); await iceReport(a, 'self-test'); }
+  const cands = (a.localDescription.sdp.match(/a=candidate:.*/g) || []).join(' / ');
+  log('self-test candidates: ' + (cands || 'none'));
+  a.close(); b.close();
+}
+$('selftest').onclick = () => selfTest().catch(e => log('self-test failed: ' + e.message));
 
 // ---------- start ----------
 $('pforget').onclick = async () => { await kv.del('laptopFp'); log('pairing forgotten'); };
