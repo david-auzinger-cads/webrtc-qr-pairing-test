@@ -91,7 +91,7 @@
       <button class="pri" id="shoot">Take photo (camera app)</button><button id="pick">Choose photo</button>
       <input type="file" id="f1" accept="image/jpeg" capture="environment" hidden><input type="file" id="f2" accept="image/*" hidden>
     </div>
-    <button id="pforget">Forget pairing</button><button class="switch">Switch role</button><button id="selftest">Self-test (this device only)</button>
+    <button id="pforget">Forget pairing</button><button class="switch">Switch role</button><button id="selftest">Self-test (this device only)</button><button id="lna">Allow local network access</button>
   </section>
 
   <section>
@@ -397,6 +397,7 @@ async function phone() {
     log(`queued in ${(performance.now() - ts).toFixed(0)} ms`);
   };
   $('rescan').onclick = scanLaptop;
+  lnaState();
   $('lshoot').onclick = () => liveShoot('phone');
   scanLaptop();
 }
@@ -432,6 +433,7 @@ async function realUfrag(p) {
 async function connect(data, tryAgreed = true) {
   const [offer, uf, pw] = data.split('~');
   const laptopFp = offer.split('|')[3];
+  lastLaptopIp = ((offer.split('|')[4] || '').split(',').map(c => c.slice(0, c.lastIndexOf(':'))).find(a => /^\d+\.\d+\.\d+\.\d+$/.test(a))) || lastLaptopIp;
   const known = (await kv.get('laptopFp')) === laptopFp;
   const wantAgreed = tryAgreed && known;
   mungedOk = false;
@@ -484,6 +486,23 @@ async function selfTest() {
   log('self-test candidates: ' + (cands || 'none'));
   a.close(); b.close();
 }
+// Chrome "Local Network Access": a public page reaching private addresses needs the site permission "local network access".
+// A fetch to a private address with targetAddressSpace 'local' makes Chrome ask for it; the request itself may fail.
+let lastLaptopIp = null;
+async function lnaState() {
+  for (const name of ['local-network-access', 'local-network', 'loopback-network']) {
+    try { const st = await navigator.permissions.query({ name }); log(`permission "${name}": ${st.state}`); } catch (e) { log(`permission "${name}": not known (${e.name})`); }
+  }
+}
+async function askLna() {
+  await lnaState();
+  const ip = lastLaptopIp || '192.168.0.1';
+  log(`asking for local network access: fetch http://${ip}/ (the request may fail; the prompt is what counts)`);
+  try { const r = await fetch(`http://${ip}/`, { targetAddressSpace: 'local', mode: 'no-cors', cache: 'no-store' }); log('fetch done: ' + r.type); }
+  catch (e) { log('fetch failed: ' + e.name + ': ' + e.message); }
+  await lnaState();
+}
+$('lna').onclick = () => askLna();
 $('selftest').onclick = () => selfTest().catch(e => log('self-test failed: ' + e.message));
 
 // ---------- start ----------
